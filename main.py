@@ -3,8 +3,10 @@ from fastmcp import FastMCP
 from requests_oauthlib import OAuth1Session
 from starlette.responses import JSONResponse
 
-# stateless_http=True disables mandatory Mcp-Session-Id header validation
-mcp = FastMCP(name="Schoology Connector", stateless_http=True)
+# set stateless mode in env so fastmcp constructor never rejects kwargs
+os.environ["FASTMCP_STATELESS_HTTP"] = "true"
+
+mcp = FastMCP(name="Schoology Connector")
 
 SCHOOLOGY_KEY = os.getenv("SCHOOLOGY_KEY")
 SCHOOLOGY_SECRET = os.getenv("SCHOOLOGY_SECRET")
