@@ -3,32 +3,28 @@ from fastmcp import FastMCP
 from requests_oauthlib import OAuth1Session
 from starlette.responses import JSONResponse
 
-# initialize mcp server
 mcp = FastMCP(name="Schoology Connector")
 
 SCHOOLOGY_KEY = os.getenv("SCHOOLOGY_KEY")
 SCHOOLOGY_SECRET = os.getenv("SCHOOLOGY_SECRET")
-SCHOOLOGY_ACCESS_TOKEN = os.getenv("SCHOOLOGY_ACCESS_TOKEN")
-SCHOOLOGY_ACCESS_SECRET = os.getenv("SCHOOLOGY_ACCESS_SECRET")
 SCHOOLOGY_DOMAIN = "https://api.schoology.com/v1"
 
 
 def get_client():
+  # 2-legged OAuth 1.0a: no resource owner tokens needed
   return OAuth1Session(
-      SCHOOLOGY_KEY,
+      client_key=SCHOOLOGY_KEY,
       client_secret=SCHOOLOGY_SECRET,
-      resource_owner_key=SCHOOLOGY_ACCESS_TOKEN,
-      resource_owner_secret=SCHOOLOGY_ACCESS_SECRET,
   )
 
 
-# --- keep-alive health route for render free tier ---
+# --- Keep-alive health check for Render / monitoring ---
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
-  return JSONResponse({"status": "healthy", "service": "schoology-mcp"})
+  return JSONResponse({"status": "ok"})
 
 
-# --- tools exposed to gemini ---
+# --- Gemini Tools ---
 @mcp.tool()
 def get_due_and_missing_assignments() -> list[dict]:
   """Fetch all upcoming, due, and incomplete assignments across enrolled courses."""
@@ -36,7 +32,7 @@ def get_due_and_missing_assignments() -> list[dict]:
   sections_resp = s.get(f"{SCHOOLOGY_DOMAIN}/users/me/sections")
 
   if sections_resp.status_code != 200:
-    return [{"error": f"schoology api returned {sections_resp.status_code}"}]
+    return [{"error": f"Schoology API error: {sections_resp.status_code}"}]
 
   sections = sections_resp.json().get("section", [])
   assignments = []
