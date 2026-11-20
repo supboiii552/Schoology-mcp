@@ -3,7 +3,6 @@ from fastmcp import FastMCP
 from requests_oauthlib import OAuth1Session
 from starlette.responses import JSONResponse
 
-# set stateless mode in env so fastmcp constructor never rejects kwargs
 os.environ["FASTMCP_STATELESS_HTTP"] = "true"
 
 mcp = FastMCP(name="Schoology Connector")
@@ -14,27 +13,42 @@ SCHOOLOGY_DOMAIN = "https://api.schoology.com/v1"
 
 
 def get_client():
-  return OAuth1Session(
+  s = OAuth1Session(
       client_key=SCHOOLOGY_KEY,
       client_secret=SCHOOLOGY_SECRET,
   )
+  s.headers.update({"Accept": "application/json"})
+  return s
 
 
-# --- keep-alive health route for render free tier ---
+def get_uid(s: OAuth1Session) -> tuple[str | None, str | None]:
+  resp = s.get(f"{SCHOOLOGY_DOMAIN}/app-user-info")
+  if resp.status_code != 200:
+    return None, f"app-user-info returned {resp.status_code}: {resp.text[:200]}"
+  uid = resp.json().get("api_uid")
+  if not uid:
+    return None, f"api_uid missing from app-user-info: {resp.text[:200]}"
+  return str(uid), None
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
   return JSONResponse({"status": "healthy", "service": "schoology-mcp"})
 
 
-# --- tools exposed to gemini ---
 @mcp.tool()
 def get_due_and_missing_assignments() -> list[dict]:
   """Fetch all upcoming, due, and incomplete assignments across enrolled courses."""
   s = get_client()
-  sections_resp = s.get(f"{SCHOOLOGY_DOMAIN}/users/me/sections")
+  uid, err = get_uid(s)
+  if err:
+    return [{"error": err}]
 
+  sections_resp = s.get(f"{SCHOOLOGY_DOMAIN}/users/{uid}/sections")
   if sections_resp.status_code != 200:
-    return [{"error": f"schoology api returned {sections_resp.status_code}"}]
+    return [
+        {"error": f"sections returned {sections_resp.status_code}: {sections_resp.text[:200]}"}
+    ]
 
   sections = sections_resp.json().get("section", [])
   assignments = []
@@ -48,6 +62,7 @@ def get_due_and_missing_assignments() -> list[dict]:
       items = assign_resp.json().get("assignment", [])
       for a in items:
         assignments.append({
+            "section_id": sec_id,
             "course": course_name,
             "title": a.get("title"),
             "due": a.get("due"),
@@ -58,12 +73,16 @@ def get_due_and_missing_assignments() -> list[dict]:
 
 
 @mcp.tool()
-def get_course_resources(section_id: str) -> dict:
-  """Retrieve documents and folders for a specific course section ID."""
+def get_course_resources(section_id: str, folder_id: str = "0") -> dict:
+  """Retrieve documents and folder contents (folder_id='0' for root) for a course section ID."""
   s = get_client()
-  docs = s.get(f"{SCHOOLOGY_DOMAIN}/sections/{section_id}/documents").json()
-  folders = s.get(f"{SCHOOLOGY_DOMAIN}/sections/{section_id}/folders").json()
-  return {"documents": docs, "folders": folders}
+  docs_resp = s.get(f"{SCHOOLOGY_DOMAIN}/sections/{section_id}/documents")
+  folder_resp = s.get(f"{SCHOOLOGY_DOMAIN}/courses/{section_id}/folder/{folder_id}")
+
+  return {
+      "documents": docs_resp.json() if docs_resp.status_code == 200 else {"error": docs_resp.status_code},
+      "folder": folder_resp.json() if folder_resp.status_code == 200 else {"error": folder_resp.status_code},
+  }
 
 
 if __name__ == "__main__":
