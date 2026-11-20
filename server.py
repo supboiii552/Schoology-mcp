@@ -1,6 +1,13 @@
+import io
 import os
+import re
+import zipfile
 from datetime import datetime
+import xml.etree.ElementTree as ET
+from docx import Document
 from fastmcp import FastMCP
+from pptx import Presentation
+from pypdf import PdfReader
 from requests_oauthlib import OAuth1Session
 from starlette.responses import JSONResponse
 
@@ -45,6 +52,26 @@ def get_all_pages(s: OAuth1Session, url: str, key: str) -> list[dict]:
   return items
 
 
+def simplify_attachments(att: dict) -> list[dict]:
+  if not isinstance(att, dict):
+    return []
+  out = []
+  for f in att.get("files", {}).get("file", []):
+    out.append({
+        "type": "file",
+        "title": f.get("title") or f.get("filename"),
+        "extension": f.get("extension"),
+        "download_path": f.get("converted_download_path") or f.get("download_path"),
+    })
+  for l in att.get("links", {}).get("link", []):
+    out.append({
+        "type": "link",
+        "title": l.get("title"),
+        "url": l.get("url"),
+    })
+  return out
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
   return JSONResponse({"status": "healthy", "service": "schoology-mcp"})
@@ -52,7 +79,7 @@ async def health_check(request):
 
 @mcp.tool()
 def get_due_and_missing_assignments(include_past: bool = False) -> list[dict]:
-  """Fetch upcoming, due, and missing assignments across all enrolled courses."""
+  """Fetch upcoming, due, and missing assignments (with descriptions & attachments) across all enrolled courses."""
   s = get_client()
   uid, err = get_uid(s)
   if err:
@@ -67,7 +94,6 @@ def get_due_and_missing_assignments(include_past: bool = False) -> list[dict]:
         )
     }]
 
-  # map assignment_id -> grade info (exception: 1=excused, 2=incomplete, 3=missing)
   grade_map = {}
   grades_resp = s.get(f"{SCHOOLOGY_DOMAIN}/users/{uid}/grades")
   if grades_resp.status_code == 200:
@@ -119,10 +145,12 @@ def get_due_and_missing_assignments(include_past: bool = False) -> list[dict]:
           "section_id": sec_id,
           "course": course_name,
           "title": a.get("title"),
+          "description": re.sub(r"<[^>]+>", " ", a.get("description") or "").strip(),
           "due": due,
           "status": status,
           "grade": g_info.get("grade"),
           "max_points": g_info.get("max_points"),
+          "attachments": simplify_attachments(a.get("attachments", {})),
       })
 
   assignments.sort(key=lambda x: x["due"] or "9999-12-31")
@@ -131,26 +159,87 @@ def get_due_and_missing_assignments(include_past: bool = False) -> list[dict]:
 
 @mcp.tool()
 def get_course_resources(section_id: str, folder_id: str = "0") -> dict:
-  """Retrieve documents and folder contents (folder_id='0' for root) for a course section ID."""
+  """Retrieve documents, links, and folder contents (folder_id='0' for root) for a course section ID."""
   s = get_client()
   docs = get_all_pages(
       s, f"{SCHOOLOGY_DOMAIN}/sections/{section_id}/documents?limit=200", "document"
   )
+  clean_docs = []
   for d in docs:
-    d.pop("completion_status", None)
+    clean_docs.append({
+        "id": d.get("id"),
+        "title": d.get("title"),
+        "folder_id": d.get("course_fid"),
+        "attachments": simplify_attachments(d.get("attachments", {})),
+    })
 
   folder_resp = s.get(
       f"{SCHOOLOGY_DOMAIN}/courses/{section_id}/folder/{folder_id}"
   )
 
   return {
-      "documents": docs,
+      "documents": clean_docs,
       "folder": (
           folder_resp.json()
           if folder_resp.status_code == 200
           else {"error": folder_resp.status_code}
       ),
   }
+
+
+@mcp.tool()
+def read_attachment(download_path: str) -> str:
+  """Download and extract text from any Schoology attachment (PDF, DOCX, PPTX, XLSX, TXT, HTML)."""
+  if not download_path.startswith("https://api.schoology.com/"):
+    return "error: invalid schoology attachment url"
+
+  s = get_client()
+  resp = s.get(download_path, allow_redirects=True)
+  if resp.status_code != 200:
+    return f"error: attachment returned {resp.status_code}"
+
+  data = resp.content
+  path_lower = download_path.lower()
+  ctype = resp.headers.get("Content-Type", "").lower()
+
+  try:
+    if "pdf" in ctype or path_lower.endswith(".pdf"):
+      reader = PdfReader(io.BytesIO(data))
+      text = "\n\n".join(p.extract_text() or "" for p in reader.pages).strip()
+      return text[:30000] if text else "error: pdf had no extractable text (scanned image)"
+
+    if "wordprocessingml" in ctype or path_lower.endswith(".docx"):
+      doc = Document(io.BytesIO(data))
+      parts = [p.text for p in doc.paragraphs if p.text.strip()]
+      for table in doc.tables:
+        for row in table.rows:
+          parts.append(" | ".join(c.text.strip() for c in row.cells))
+      return "\n".join(parts).strip()[:30000]
+
+    if "presentationml" in ctype or path_lower.endswith(".pptx"):
+      prs = Presentation(io.BytesIO(data))
+      slides = []
+      for i, slide in enumerate(prs.slides, 1):
+        lines = [sh.text.strip() for sh in slide.shapes if sh.has_text_frame and sh.text.strip()]
+        if lines:
+          slides.append(f"[Slide {i}]\n" + "\n".join(lines))
+      return "\n\n".join(slides).strip()[:30000]
+
+    if "spreadsheetml" in ctype or path_lower.endswith(".xlsx"):
+      with zipfile.ZipFile(io.BytesIO(data)) as z:
+        strings = []
+        if "xl/sharedStrings.xml" in z.namelist():
+          root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+          strings = ["".join(t.itertext()) for t in root]
+        return "\n".join(strings).strip()[:30000]
+
+    if "html" in ctype or path_lower.endswith((".html", ".htm")):
+      clean = re.sub(r"<[^>]+>", " ", resp.text)
+      return re.sub(r"\s+", " ", clean).strip()[:30000]
+
+    return resp.text[:30000]
+  except Exception as e:
+    return f"error parsing file: {e}"
 
 
 if __name__ == "__main__":
