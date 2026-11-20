@@ -3,3 +3,7 @@ requests
 requests-oauthlib
 starlette
 uvicorn
+requests-oauthlib
+pypdf
+python-docx
+python-pptx
